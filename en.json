@@ -1,0 +1,49 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Trackmate Login",
+        "description": "Enter your Trackmate GPS account credentials",
+        "data": {
+          "label": "Account Name",
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Trackmate Account",
+        "description": "Your Trackmate GPS session has expired. Please enter your credentials again for account: {account}",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password",
+      "cannot_connect": "Unable to connect to Trackmate GPS. Please check your internet connection and try again.",
+      "unknown": "Unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "This account is already configured",
+      "reauth_successful": "Re-authentication successful"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Trackmate GPS Options",
+        "description": "Configure polling interval and select which vehicles to track. Scan interval must be between {min_interval} and {max_interval} seconds (default: {default_interval}).",
+        "data": {
+          "buses": "Vehicles to Track (leave empty for all)",
+          "scan_interval": "Scan Interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "scan_interval_too_low": "Scan interval is too low. Minimum is {min_interval} seconds to avoid rate limiting.",
+      "scan_interval_too_high": "Scan interval is too high. Maximum is {max_interval} seconds.",
+      "cannot_fetch_vehicles": "Unable to fetch vehicle list. Please try again later."
+    }
+  }
+}
