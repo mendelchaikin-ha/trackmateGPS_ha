@@ -110,8 +110,19 @@ class TrackmateAPI:
             try:
                 # Convert cookies to serializable format
                 cookie_dict = {}
-                for key, morsel in self.cookies.items():
-                    cookie_dict[key] = morsel.value
+                
+                # Handle both dict and SimpleCookie types
+                if isinstance(self.cookies, dict):
+                    # Already a dict, but might contain Morsel objects
+                    for key, value in self.cookies.items():
+                        if hasattr(value, 'value'):
+                            cookie_dict[key] = value.value
+                        else:
+                            cookie_dict[key] = str(value)
+                else:
+                    # SimpleCookie or similar
+                    for key, morsel in self.cookies.items():
+                        cookie_dict[key] = morsel.value if hasattr(morsel, 'value') else str(morsel)
                 
                 await self.store.async_save({
                     "cookies": cookie_dict,
@@ -134,26 +145,76 @@ class TrackmateAPI:
             _LOGGER.info("Logging in to Trackmate GPS")
             await self.rate_limiter.acquire()
             
-            payload = {"Email": self.username, "Password": self.password}
-            
             try:
+                # Step 1: GET login page to obtain CSRF token and initial cookies
+                _LOGGER.debug("Fetching login page for CSRF token")
+                async with self.session.get(
+                    self.LOGIN_URL,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.5",
+                    }
+                ) as get_resp:
+                    get_resp.raise_for_status()
+                    login_page = await get_resp.text()
+                    
+                    # Extract CSRF token from the page
+                    csrf_token = self._extract_csrf_token(login_page)
+                    if not csrf_token:
+                        _LOGGER.error("Failed to extract CSRF token from login page")
+                        raise ConfigEntryAuthFailed("Failed to obtain CSRF token")
+                    
+                    _LOGGER.debug("Extracted CSRF token")
+                    
+                    # Store cookies from GET request
+                    initial_cookies = get_resp.cookies
+                
+                # Step 2: POST login with CSRF token and credentials
+                await self.rate_limiter.acquire()
+                
+                payload = {
+                    "Email": self.username,
+                    "Password": self.password,
+                    "__RequestVerificationToken": csrf_token,
+                }
+                
                 async with self.session.post(
-                    self.LOGIN_URL, 
+                    self.LOGIN_URL,
                     data=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as resp:
-                    resp.raise_for_status()
-                    
-                    # Check if login was successful
-                    if resp.url.path.endswith("/Login") or "error" in str(resp.url).lower():
-                        _LOGGER.error("Login failed - invalid credentials")
-                        raise ConfigEntryAuthFailed("Invalid username or password")
-                    
-                    self.cookies = resp.cookies
-                    self.cookie_expiry = datetime.now() + timedelta(hours=COOKIE_EXPIRY_HOURS)
-                    
-                    _LOGGER.info("Login successful, cookies valid until %s", self.cookie_expiry)
-                    await self._save_cookies()
+                    cookies=initial_cookies,
+                    allow_redirects=False,  # Don't auto-follow redirects
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Referer": self.LOGIN_URL,
+                    }
+                ) as post_resp:
+                    # Check for successful login
+                    # Trackmate redirects on success (302), stays on login page on failure
+                    if post_resp.status == 302 or post_resp.status == 200:
+                        # Check redirect location or response
+                        location = post_resp.headers.get("Location", "")
+                        
+                        # If redirected back to login, auth failed
+                        if "/Login" in location or post_resp.status == 200:
+                            resp_text = await post_resp.text()
+                            if "invalid" in resp_text.lower() or "incorrect" in resp_text.lower():
+                                _LOGGER.error("Login failed - invalid credentials")
+                                raise ConfigEntryAuthFailed("Invalid username or password")
+                        
+                        # Success - merge cookies
+                        self.cookies = {**initial_cookies, **post_resp.cookies}
+                        self.cookie_expiry = datetime.now() + timedelta(hours=COOKIE_EXPIRY_HOURS)
+                        
+                        _LOGGER.info("Login successful, cookies valid until %s", self.cookie_expiry)
+                        await self._save_cookies()
+                    else:
+                        _LOGGER.error("Unexpected response status: %d", post_resp.status)
+                        raise ConfigEntryAuthFailed(f"Login failed with status {post_resp.status}")
                     
             except aiohttp.ClientError as err:
                 _LOGGER.error("Network error during login: %s", err)
@@ -161,6 +222,33 @@ class TrackmateAPI:
             except asyncio.TimeoutError:
                 _LOGGER.error("Login request timed out")
                 raise ConfigEntryAuthFailed("Login request timed out")
+    
+    def _extract_csrf_token(self, html: str) -> Optional[str]:
+        """Extract CSRF token from login page HTML.
+        
+        Args:
+            html: HTML content of login page.
+            
+        Returns:
+            CSRF token string or None if not found.
+        """
+        import re
+        
+        # Try multiple patterns as websites use different token names
+        patterns = [
+            r'<input[^>]*name=["\']__RequestVerificationToken["\'][^>]*value=["\']([^"\']+)["\']',
+            r'<input[^>]*value=["\']([^"\']+)["\'][^>]*name=["\']__RequestVerificationToken["\']',
+            r'name="__RequestVerificationToken"[^>]*value="([^"]+)"',
+            r'value="([^"]+)"[^>]*name="__RequestVerificationToken"',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        
+        _LOGGER.warning("Could not find CSRF token in login page")
+        return None
 
     async def get_positions(self) -> Dict[str, Any]:
         """Get latest vehicle positions."""
@@ -172,17 +260,25 @@ class TrackmateAPI:
                 self.DATA_URL,
                 data="dummy=1",
                 cookies=self.cookies,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": "https://trackmategps.com/en-US/Tracking",
+                }
             ) as resp:
-                resp.raise_for_status()
-                
                 # Check if we got redirected to login (session expired)
-                if resp.url.path.endswith("/Login"):
+                if resp.url.path.endswith("/Login") or "/Account/Login" in str(resp.url):
                     _LOGGER.warning("Session expired, forcing re-authentication")
                     self.cookies = None
                     self.cookie_expiry = None
                     # Retry with fresh login
                     return await self.get_positions()
+                
+                resp.raise_for_status()
                 
                 data = await resp.json()
                 _LOGGER.debug("Retrieved position data for %d vehicles", 
