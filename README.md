@@ -6,7 +6,7 @@
 
 Enterprise-grade Home Assistant integration for Trackmate GPS vehicle tracking.
 
-## Version 1.1.0 - Enterprise Features
+## Version 1.1.1 - Enterprise Features
 
 ### 🚀 What's New in v1.1
 
