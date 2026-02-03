@@ -110,8 +110,19 @@ class TrackmateAPI:
             try:
                 # Convert cookies to serializable format
                 cookie_dict = {}
-                for key, morsel in self.cookies.items():
-                    cookie_dict[key] = morsel.value
+                
+                # Handle both dict and SimpleCookie types
+                if isinstance(self.cookies, dict):
+                    # Already a dict, but might contain Morsel objects
+                    for key, value in self.cookies.items():
+                        if hasattr(value, 'value'):
+                            cookie_dict[key] = value.value
+                        else:
+                            cookie_dict[key] = str(value)
+                else:
+                    # SimpleCookie or similar
+                    for key, morsel in self.cookies.items():
+                        cookie_dict[key] = morsel.value if hasattr(morsel, 'value') else str(morsel)
                 
                 await self.store.async_save({
                     "cookies": cookie_dict,
@@ -122,7 +133,7 @@ class TrackmateAPI:
                 _LOGGER.warning("Failed to save cookies to storage: %s", err)
 
     async def login(self):
-        """Login to Trackmate and obtain session cookies."""
+        """Login to Trackmate GPS (no CSRF version)."""
         async with self._login_lock:
             # Check if we have valid cookies
             if self.cookies and self.cookie_expiry:
@@ -134,25 +145,39 @@ class TrackmateAPI:
             _LOGGER.info("Logging in to Trackmate GPS")
             await self.rate_limiter.acquire()
             
-            payload = {"Email": self.username, "Password": self.password}
+            payload = {
+                "Email": self.username,
+                "Password": self.password,
+            }
             
             try:
                 async with self.session.post(
-                    self.LOGIN_URL, 
+                    self.LOGIN_URL,
                     data=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": "https://trackmategps.com",
+                        "Referer": self.LOGIN_URL,
+                    }
                 ) as resp:
-                    resp.raise_for_status()
+                    _LOGGER.debug("Login response: status=%d, url=%s", resp.status, resp.url)
                     
-                    # Check if login was successful
-                    if resp.url.path.endswith("/Login") or "error" in str(resp.url).lower():
-                        _LOGGER.error("Login failed - invalid credentials")
+                    final_url = str(resp.url)
+                    
+                    # Check if still on login page (failed)
+                    if "Login" in final_url or "login" in final_url:
+                        _LOGGER.error("Login failed - still on login page")
                         raise ConfigEntryAuthFailed("Invalid username or password")
                     
+                    # Success - save cookies
                     self.cookies = resp.cookies
                     self.cookie_expiry = datetime.now() + timedelta(hours=COOKIE_EXPIRY_HOURS)
                     
-                    _LOGGER.info("Login successful, cookies valid until %s", self.cookie_expiry)
+                    _LOGGER.info("Login successful, redirected to: %s", final_url)
                     await self._save_cookies()
                     
             except aiohttp.ClientError as err:
@@ -172,17 +197,25 @@ class TrackmateAPI:
                 self.DATA_URL,
                 data="dummy=1",
                 cookies=self.cookies,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": "https://trackmategps.com/en-US/Tracking",
+                }
             ) as resp:
-                resp.raise_for_status()
-                
                 # Check if we got redirected to login (session expired)
-                if resp.url.path.endswith("/Login"):
+                if resp.url.path.endswith("/Login") or "/Account/Login" in str(resp.url):
                     _LOGGER.warning("Session expired, forcing re-authentication")
                     self.cookies = None
                     self.cookie_expiry = None
                     # Retry with fresh login
                     return await self.get_positions()
+                
+                resp.raise_for_status()
                 
                 data = await resp.json()
                 _LOGGER.debug("Retrieved position data for %d vehicles", 
