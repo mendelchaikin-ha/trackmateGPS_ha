@@ -1,0 +1,41 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Trackmate GPS Setup",
+        "description": "Enter your TrackmateGPS credentials. Requires FlareSolverr addon to be running (from alexbelgium's repo).",
+        "data": {
+          "flaresolverr_url": "FlareSolverr URL",
+          "username": "TrackmateGPS Username",
+          "password": "TrackmateGPS Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate",
+        "description": "Enter your updated TrackmateGPS password.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach FlareSolverr. Is the addon running?",
+      "invalid_auth": "Invalid TrackmateGPS credentials.",
+      "unknown": "Unexpected error. Check logs."
+    },
+    "abort": {
+      "already_configured": "This account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "scan_interval": "Update interval (seconds)",
+          "session_refresh_minutes": "Session refresh interval (minutes)",
+          "vehicle_ids": "Track only these vehicles (leave empty for all)"
+        }
+      }
+    }
+  }
+}
