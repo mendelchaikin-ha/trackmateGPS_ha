@@ -1,276 +1,83 @@
-# Trackmate GPS Integration for Home Assistant
+# TrackmateGPS for Home Assistant
 
-[![CI](https://github.com/example/trackmate_ha/workflows/CI/badge.svg)](https://github.com/example/trackmate_ha/actions)
-[![codecov](https://codecov.io/gh/example/trackmate_ha/branch/main/graph/badge.svg)](https://codecov.io/gh/example/trackmate_ha)
-[![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg)](https://github.com/hacs/integration)
+Track your [TrackmateGPS](https://trackmategps.com) vehicles in Home Assistant. Supports **multiple accounts**.
 
-Enterprise-grade Home Assistant integration for Trackmate GPS vehicle tracking.
+## How it works
 
-## Version 1.1.1 - Enterprise Features
+```
+┌─────────────────┐     ┌────────────────────────────┐
+│  FlareSolverr   │◄────│  Trackmate GPS Integration │
+│  (alexbelgium)  │     │  (this repo)               │
+│  Handles CF +   │     │  Login → scrape → entities  │
+│  browser engine │     │                            │
+└─────────────────┘     └────────────────────────────┘
+```
 
-### 🚀 What's New in v1.1
+TrackmateGPS is protected by Cloudflare. This integration uses [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) (available as an addon from [alexbelgium's repo](https://github.com/alexbelgium/hassio-addons)) to bypass Cloudflare, log in, and then scrapes vehicle positions with standard HTTP using the authenticated session cookies.
 
-- **Cookie Persistence**: Sessions persist across Home Assistant restarts
-- **Automatic Reauth**: Smart reauth flow when credentials expire
-- **Configurable Polling**: Adjust update frequency via UI slider (10-300 seconds)
-- **Rate Limiting**: Built-in protection against API bans
-- **Diagnostics Panel**: Detailed system health information
-- **Logger Debug Mode**: Enhanced debugging capabilities
-- **GitHub Actions CI**: Automated testing and validation
-- **Comprehensive Tests**: Full pytest suite with HA test harness
+## Prerequisites
 
-## Features
+**FlareSolverr** must be installed and running before setting up this integration.
 
-### Core Functionality
-- Real-time GPS tracking of Trackmate vehicles
-- Device tracker entities for each vehicle
-- Latitude/longitude position tracking
-- Speed and heading information (when available)
-- Automatic session management
-
-### Enterprise Capabilities
-- **Persistent Sessions**: Cookies stored securely, survive restarts
-- **Smart Authentication**: Automatic reauth flow via HA UI
-- **Rate Limiting**: 60 requests/hour limit with automatic throttling
-- **Configurable Polling**: 10-300 second intervals, default 30s
-- **Error Handling**: Comprehensive error recovery and logging
-- **Diagnostics**: Built-in system health monitoring
+1. Go to **Settings → Add-ons → Add-on Store → ⋮ → Repositories**
+2. Add: `https://github.com/alexbelgium/hassio-addons`
+3. Find and install **FlareSolverr**
+4. Start FlareSolverr (default: port 8191)
 
 ## Installation
 
-### HACS (Recommended)
+1. Add this repo to [HACS](https://hacs.xyz) as a custom repository (type: **Integration**)
+2. Install **Trackmate GPS** from HACS
+3. Restart Home Assistant
+4. Go to **Settings → Devices & Services → Add Integration → Trackmate GPS**
+5. Enter:
+   - **FlareSolverr URL**: `http://localhost:8191/v1` (default)
+   - **Username**: Your TrackmateGPS email/username
+   - **Password**: Your TrackmateGPS password
+6. Your vehicles appear as `device_tracker` entities on the map
 
-1. Add this repository to HACS as a custom repository
-2. Search for "Trackmate GPS" in HACS
-3. Click Install
-4. Restart Home Assistant
+### Multiple accounts
 
-### Manual Installation
+Just add the integration again for each account. Each gets its own config entry and set of `device_tracker` entities.
 
-1. Copy the `custom_components/trackmate` directory to your Home Assistant `custom_components` folder
-2. Restart Home Assistant
+## Options
 
-## Configuration
+After setup, click **Configure** on the integration to adjust:
 
-### Initial Setup
+| Option | Default | Description |
+|--------|---------|-------------|
+| Update interval | 30s | How often to poll vehicle positions |
+| Session refresh | 30min | How often to re-login to keep session alive |
+| Vehicle filter | All | Optionally track only specific vehicles |
 
-1. Go to **Settings** → **Devices & Services**
-2. Click **+ Add Integration**
-3. Search for "Trackmate GPS"
-4. Enter your credentials:
-   - **Account Name**: Friendly name for this account
-   - **Email**: Your Trackmate GPS email
-   - **Password**: Your Trackmate GPS password
+## Troubleshooting
 
-### Options
+| Problem | Fix |
+|---------|-----|
+| "Cannot reach FlareSolverr" | Make sure FlareSolverr addon is running. Check the URL. |
+| "Invalid credentials" | Verify you can log in at trackmategps.com manually. |
+| No vehicles after setup | This is the trickiest part — the integration tries multiple scraping strategies (API probing, HTML parsing, JS rendering). Enable debug logging (`custom_components.trackmate`) and check what's happening. |
+| Vehicles disappear | Session may have expired. The integration auto-re-logins, but check logs. |
 
-After setup, click **Configure** on the integration to access:
+### Debug logging
 
-#### Vehicle Selection
-- Select specific vehicles to track
-- Leave empty to track all vehicles
-- Updated dynamically from your account
-
-#### Scan Interval
-- **Range**: 10-300 seconds
-- **Default**: 30 seconds
-- **Recommended**: 30-60 seconds for normal use
-- **Note**: Lower intervals may trigger rate limiting
-
-## Rate Limiting
-
-The integration includes built-in rate limiting to prevent API bans:
-
-- **Limit**: 60 requests per hour
-- **Behavior**: Automatic throttling when limit approached
-- **Status**: Check Diagnostics panel for current usage
-
-### Recommended Settings
-- **Normal use**: 30-60 second interval
-- **High-frequency tracking**: 15-30 seconds (monitor rate limit)
-- **Battery saving**: 60-300 seconds
-
-## Reauth Flow
-
-If your session expires or credentials change:
-
-1. You'll receive a notification in Home Assistant
-2. Click the notification or go to the integration
-3. Click **Reauthenticate**
-4. Enter your credentials
-5. Integration resumes automatically
-
-## Diagnostics
-
-Access detailed diagnostics via:
-1. Go to **Settings** → **Devices & Services**
-2. Find your Trackmate GPS integration
-3. Click the three dots menu
-4. Select **Download Diagnostics**
-
-### Diagnostics Include
-- Cookie/session status
-- Rate limiter statistics
-- Vehicle count and information
-- Update success status
-- Configuration details
-
-## Debug Logging
-
-Enable debug logging in `configuration.yaml`:
+Add to `configuration.yaml`:
 
 ```yaml
 logger:
-  default: info
   logs:
     custom_components.trackmate: debug
 ```
 
-Then check logs in **Settings** → **System** → **Logs**
+## Technical details
 
-## Device Tracker Entities
-
-Each tracked vehicle creates a device tracker entity:
-
-- **Entity ID**: `device_tracker.trackmate_{vehicle_name}`
-- **Attributes**:
-  - `latitude`: Current latitude
-  - `longitude`: Current longitude
-  - `speed`: Speed (if available)
-  - `heading`: Heading/direction (if available)
-  - `source_type`: Always "gps"
-
-## Development
-
-### Setup Development Environment
-
-```bash
-# Clone repository
-git clone https://github.com/example/trackmate_ha.git
-cd trackmate_ha
-
-# Install development dependencies
-pip install -r requirements_dev.txt
-pip install -r requirements_test.txt
-
-# Install pre-commit hooks
-pre-commit install
-```
-
-### Running Tests
-
-```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=custom_components/trackmate
-
-# Run specific test file
-pytest tests/test_api.py -v
-
-# Run with Home Assistant test harness
-pytest tests/ --homeassistant-version=latest
-```
-
-### Code Quality
-
-```bash
-# Format code
-black custom_components/trackmate
-
-# Sort imports
-isort custom_components/trackmate
-
-# Lint
-flake8 custom_components/trackmate
-
-# Type check
-mypy custom_components/trackmate
-
-# Run all pre-commit hooks
-pre-commit run --all-files
-```
-
-### GitHub Actions
-
-All PRs and commits are automatically tested:
-- ✅ Code formatting (black, isort)
-- ✅ Linting (flake8)
-- ✅ Type checking (mypy)
-- ✅ Unit tests (pytest)
-- ✅ Home Assistant validation (hassfest)
-- ✅ HACS validation
-- ✅ Integration tests
-
-## Troubleshooting
-
-### Session Expired Repeatedly
-- Check credentials are correct
-- Verify Trackmate website is accessible
-- Check rate limiting hasn't been triggered
-- Review diagnostics for cookie expiry time
-
-### Rate Limited
-- Increase scan interval to 60+ seconds
-- Check diagnostics for rate limiter status
-- Wait 1 hour for rate limit to reset
-
-### No Vehicles Showing
-- Verify vehicles exist in your Trackmate account
-- Check integration options → vehicle selection
-- Review logs for API errors
-- Download diagnostics to verify data structure
-
-### Connection Errors
-- Verify internet connectivity
-- Check Trackmate website status
-- Review firewall/proxy settings
-- Check Home Assistant logs for detailed errors
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/example/trackmate_ha/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/example/trackmate_ha/discussions)
-- **Home Assistant Community**: [Community Thread](https://community.home-assistant.io/)
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add/update tests
-5. Ensure all tests pass
-6. Submit a pull request
-
-## License
-
-MIT License - see LICENSE file for details
-
-## Credits
-
-Developed for the Home Assistant community.
-
-## Changelog
-
-### v1.1.0 (2026-02-01)
-- ✨ Cookie persistence across restarts
-- ✨ Automatic reauth flow via HA UI
-- ✨ Configurable polling slider (10-300s)
-- ✨ Built-in rate limiting (60 req/hour)
-- ✨ Diagnostics panel
-- ✨ Enhanced debug logging
-- ✨ GitHub Actions CI/CD
-- ✨ Comprehensive pytest suite
-- ✨ Home Assistant test harness
-- 🐛 Fixed session expiry handling
-- 🐛 Improved error recovery
-- 📝 Complete documentation
-
-### v1.0.0
-- Initial release
-- Basic GPS tracking
-- Vehicle selection
-- Config flow
+1. Creates a FlareSolverr session per account
+2. `request.get` loads the login page (FlareSolverr solves Cloudflare challenge)
+3. Parses ASP.NET anti-forgery token from the HTML
+4. `request.post` submits the login form with credentials
+5. Extracts session cookies from FlareSolverr response
+6. Uses plain `aiohttp` with those cookies to:
+   - Probe TrackmateGPS API endpoints (e.g., `/en/Map/GetVehicles`)
+   - Parse the map page HTML for embedded vehicle data
+   - Fall back to FlareSolverr rendering for JS-only data
+7. Creates `device_tracker` entities with GPS coordinates
