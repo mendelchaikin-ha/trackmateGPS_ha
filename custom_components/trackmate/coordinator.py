@@ -1,59 +1,60 @@
-"""Trackmate GPS coordinator with configurable polling."""
+"""DataUpdateCoordinator for Trackmate GPS."""
+
+from __future__ import annotations
+
 import logging
+import time
 from datetime import timedelta
-from typing import Any, Dict
+from typing import Any
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import (
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DEFAULT_SCAN_INTERVAL
+from .api import TrackmateAuthError, TrackmateClient, TrackmateConnectionError, TrackmateError
+from .const import CONF_SCAN_INTERVAL, CONF_SESSION_REFRESH, CONF_VEHICLE_IDS, DEFAULT_SCAN_INTERVAL, DEFAULT_SESSION_REFRESH, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class TrackmateCoordinator(DataUpdateCoordinator):
-    """Coordinator to manage Trackmate GPS data updates."""
+class TrackmateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
-    def __init__(self, hass: HomeAssistant, api, scan_interval: int = DEFAULT_SCAN_INTERVAL):
-        """Initialize the coordinator."""
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry,
+                 client: TrackmateClient) -> None:
+        self.client = client
+        self.entry = entry
+        self._last_login = time.monotonic()
+        self._refresh_mins = entry.options.get(
+            CONF_SESSION_REFRESH, DEFAULT_SESSION_REFRESH)
         super().__init__(
-            hass,
-            _LOGGER,
-            name="Trackmate GPS",
-            update_interval=timedelta(seconds=scan_interval),
+            hass, _LOGGER, name=DOMAIN,
+            update_interval=timedelta(
+                seconds=entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)),
         )
-        self.api = api
-        self._scan_interval = scan_interval
 
-    async def _async_update_data(self) -> Dict[str, Any]:
-        """Fetch data from Trackmate API."""
+    async def _async_update_data(self) -> dict[str, Any]:
+        # Re-login if session refresh interval exceeded
+        elapsed = (time.monotonic() - self._last_login) / 60
+        if elapsed > self._refresh_mins or not self.client.logged_in:
+            try:
+                await self.client.login()
+                self._last_login = time.monotonic()
+            except TrackmateAuthError as e:
+                raise ConfigEntryAuthFailed(str(e)) from e
+            except TrackmateConnectionError as e:
+                raise UpdateFailed(str(e)) from e
+
         try:
-            _LOGGER.debug("Updating Trackmate GPS data")
-            data = await self.api.get_positions()
-            
-            if not data or "MotusObject" not in data:
-                _LOGGER.warning("Received invalid data from API")
-                raise UpdateFailed("Invalid data received from API")
-            
-            points = data.get("MotusObject", {}).get("Points", [])
-            _LOGGER.debug("Successfully updated data for %d vehicles", len(points))
-            
-            return data
-            
-        except ConfigEntryAuthFailed as err:
-            # This will trigger a reauth flow
-            _LOGGER.error("Authentication failed: %s", err)
-            raise
-        except Exception as err:
-            _LOGGER.error("Error fetching Trackmate data: %s", err)
-            raise UpdateFailed(f"Error communicating with API: {err}")
+            vehicles = await self.client.get_vehicles()
+        except TrackmateAuthError as e:
+            raise ConfigEntryAuthFailed(str(e)) from e
+        except TrackmateConnectionError as e:
+            raise UpdateFailed(str(e)) from e
+        except TrackmateError as e:
+            raise UpdateFailed(str(e)) from e
 
-    def update_scan_interval(self, scan_interval: int):
-        """Update the scan interval."""
-        self._scan_interval = scan_interval
-        self.update_interval = timedelta(seconds=scan_interval)
-        _LOGGER.info("Updated scan interval to %d seconds", scan_interval)
+        selected = self.entry.options.get(CONF_VEHICLE_IDS, [])
+        if selected:
+            vehicles = {k: v for k, v in vehicles.items() if k in selected}
+        return vehicles
