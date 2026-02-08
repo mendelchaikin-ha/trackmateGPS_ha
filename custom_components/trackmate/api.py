@@ -1,14 +1,16 @@
-"""Trackmate GPS API client with enterprise features."""
+"""Trackmate GPS API client - Self-contained with automatic cookie management."""
 import aiohttp
 import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from collections import deque
+import json
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     STORAGE_VERSION,
@@ -35,55 +37,109 @@ class RateLimiter:
         """Wait if necessary to respect rate limits."""
         now = datetime.now()
         
-        # Remove old requests outside the window
         while self.requests and (now - self.requests[0]).total_seconds() > self.window:
             self.requests.popleft()
         
-        # If we're at the limit, wait
         if len(self.requests) >= self.max_requests:
             oldest_request = self.requests[0]
             wait_time = self.window - (now - oldest_request).total_seconds()
             if wait_time > 0:
-                _LOGGER.debug(
-                    "Rate limit reached. Waiting %.2f seconds before next request",
-                    wait_time,
-                )
+                _LOGGER.debug("Rate limit reached. Waiting %.2f seconds", wait_time)
                 await asyncio.sleep(wait_time)
-                # Recursively try again
                 await self.acquire()
                 return
         
-        # Record this request
         self.requests.append(now)
 
 
 class TrackmateAPI:
-    """Trackmate GPS API client."""
+    """Trackmate GPS API client with automatic cookie management."""
 
     LOGIN_URL = "https://trackmategps.com/Account/Login"
     DATA_URL = "https://trackmategps.com/en-US/Tracking/GetLatestPositions"
 
-    def __init__(self, hass: HomeAssistant, username: str, password: str):
+    def __init__(self, hass: HomeAssistant, username: str, password: str, entry_id: Optional[str] = None):
         """Initialize the API client."""
         self.hass = hass
         self.username = username
         self.password = password
+        self.entry_id = entry_id or "temp"
         self.session: Optional[aiohttp.ClientSession] = None
-        self.cookies: Optional[Dict] = None
+        self.cookies: Optional[Dict[str, str]] = None
         self.cookie_expiry: Optional[datetime] = None
-        self.store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+        self.store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{self.entry_id}")
         self.rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
         self._login_lock = asyncio.Lock()
+        self._refresh_task = None
+        self._refresh_unsub = None
 
     async def async_setup(self):
         """Set up the API client."""
-        self.session = aiohttp.ClientSession()
+        _LOGGER.error("!!! ASYNC_SETUP CALLED !!!")
+        _LOGGER.info("Setting up Trackmate API client for %s (entry_id: %s)", self.username, self.entry_id)
+        
+        # Create session with relaxed SSL (some HA installations have SSL issues)
+        _LOGGER.error("!!! Creating SSL context !!!")
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        _LOGGER.error("!!! Creating connector with system DNS !!!")
+        # Use ThreadedResolver instead of aiodns (which times out)
+        from aiohttp.resolver import ThreadedResolver
+        resolver = ThreadedResolver()
+        
+        connector = aiohttp.TCPConnector(
+            ssl=ssl_context,
+            resolver=resolver  # Use threaded (system) DNS resolver
+        )
+        
+        _LOGGER.error("!!! Creating session !!!")
+        self.session = aiohttp.ClientSession(connector=connector)
+        _LOGGER.debug("HTTP session created (using system DNS resolver)")
+        
+        _LOGGER.error("!!! Loading cookies !!!")
         await self._load_cookies()
+        
+        _LOGGER.error("!!! Setup complete !!!")
+        
+        # Only start background refresh if this is a real entry (not validation)
+        if self.entry_id != "temp":
+            self._start_cookie_refresh_timer()
+            _LOGGER.info("Background cookie refresh scheduled")
+        else:
+            _LOGGER.debug("Skipping background refresh setup for validation")
 
     async def async_close(self):
         """Close the API client."""
+        # Stop background refresh
+        if self._refresh_unsub:
+            self._refresh_unsub()
+        
         if self.session:
             await self.session.close()
+
+    def _start_cookie_refresh_timer(self):
+        """Start the automatic cookie refresh timer."""
+        # Refresh every 11 hours
+        refresh_interval = timedelta(hours=11)
+        
+        async def _refresh_cookies_task(now):
+            """Background task to refresh cookies."""
+            try:
+                _LOGGER.info("Background cookie refresh triggered")
+                await self._refresh_cookies()
+            except Exception as err:
+                _LOGGER.error("Background cookie refresh failed: %s", err)
+        
+        # Schedule the refresh
+        self._refresh_unsub = async_track_time_interval(
+            self.hass,
+            _refresh_cookies_task,
+            refresh_interval
+        )
+        _LOGGER.info("Cookie auto-refresh scheduled every 11 hours")
 
     async def _load_cookies(self):
         """Load cookies from persistent storage."""
@@ -96,7 +152,6 @@ class TrackmateAPI:
                     self.cookie_expiry = datetime.fromisoformat(expiry_str)
                     _LOGGER.debug("Loaded cookies from storage, expiry: %s", self.cookie_expiry)
                     
-                    # Check if cookies are still valid
                     if datetime.now() >= self.cookie_expiry:
                         _LOGGER.info("Stored cookies expired, will re-authenticate")
                         self.cookies = None
@@ -108,181 +163,237 @@ class TrackmateAPI:
         """Save cookies to persistent storage."""
         if self.cookies and self.cookie_expiry:
             try:
-                # Convert cookies to serializable format
-                cookie_dict = {}
-                
-                # Handle both dict and SimpleCookie types
-                if isinstance(self.cookies, dict):
-                    # Already a dict, but might contain Morsel objects
-                    for key, value in self.cookies.items():
-                        if hasattr(value, 'value'):
-                            cookie_dict[key] = value.value
-                        else:
-                            cookie_dict[key] = str(value)
-                else:
-                    # SimpleCookie or similar
-                    for key, morsel in self.cookies.items():
-                        cookie_dict[key] = morsel.value if hasattr(morsel, 'value') else str(morsel)
-                
                 await self.store.async_save({
-                    "cookies": cookie_dict,
+                    "cookies": self.cookies,
                     "expiry": self.cookie_expiry.isoformat(),
                 })
                 _LOGGER.debug("Saved cookies to storage")
             except Exception as err:
                 _LOGGER.warning("Failed to save cookies to storage: %s", err)
 
-    async def login(self):
-        """Login to Trackmate GPS (no CSRF version)."""
-        async with self._login_lock:
-            # Check if we have valid cookies
-            if self.cookies and self.cookie_expiry:
-                time_until_expiry = (self.cookie_expiry - datetime.now()).total_seconds()
-                if time_until_expiry > COOKIE_REFRESH_BEFORE_EXPIRY:
-                    _LOGGER.debug("Using cached cookies (valid for %.0f more seconds)", time_until_expiry)
-                    return
-
-            _LOGGER.info("Logging in to Trackmate GPS")
-            await self.rate_limiter.acquire()
+    async def _http_login(self) -> Dict[str, str]:
+        """Login using direct HTTP requests (no browser needed)."""
+        _LOGGER.info("==> _http_login() ENTERED <==")
+        _LOGGER.info("Logging in to Trackmate via HTTP...")
+        _LOGGER.debug("Username: %s", self.username)
+        _LOGGER.debug("Login URL: %s", self.LOGIN_URL)
+        
+        # Quick connectivity test first
+        try:
+            _LOGGER.info("Testing basic connectivity...")
+            async with self.session.get(
+                "https://trackmategps.com/",
+                timeout=aiohttp.ClientTimeout(total=5),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                }
+            ) as test_resp:
+                _LOGGER.info("✓ Connectivity OK - status %d", test_resp.status)
+        except Exception as e:
+            _LOGGER.error("✗ Connectivity test failed: %s", e)
+            raise ConfigEntryAuthFailed(f"Cannot reach trackmategps.com: {e}")
+        
+        try:
+            # Step 1: GET login page to get CSRF token
+            _LOGGER.debug("Step 1: Getting login page for CSRF token")
+            _LOGGER.debug("About to make GET request to %s", self.LOGIN_URL)
             
-<<<<<<< HEAD
-            payload = {
-                "Email": self.username,
-                "Password": self.password,
-            }
+            async with self.session.get(
+                self.LOGIN_URL,
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                }
+            ) as resp:
+                _LOGGER.debug("GET request completed!")
+                _LOGGER.debug("Login page response status: %d", resp.status)
+                resp.raise_for_status()
+                html = await resp.text()
+                _LOGGER.debug("Login page HTML length: %d", len(html))
+                
+                # Log first 500 chars to see what we're getting
+                _LOGGER.debug("HTML preview: %s", html[:500])
+                
+                # Extract CSRF token
+                import re
+                csrf_match = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', html)
+                csrf_token = csrf_match.group(1) if csrf_match else ""
+                _LOGGER.debug("CSRF token found: %s", "Yes" if csrf_token else "No")
+                
+                # Also look for what input fields exist
+                email_field = "Email" in html
+                username_field = "Username" in html or "username" in html
+                _LOGGER.debug("Form has 'Email' field: %s", email_field)
+                _LOGGER.debug("Form has 'Username' field: %s", username_field)
             
-=======
->>>>>>> 988f4ceecb7c9c82c57bea4e5ecb778a388dc5aa
-            try:
-                # Step 1: GET login page to obtain CSRF token and initial cookies
-                _LOGGER.debug("Fetching login page for CSRF token")
-                async with self.session.get(
-                    self.LOGIN_URL,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.5",
-                    }
-                ) as get_resp:
-                    get_resp.raise_for_status()
-                    login_page = await get_resp.text()
-                    
-                    # Extract CSRF token from the page
-                    csrf_token = self._extract_csrf_token(login_page)
-                    if not csrf_token:
-                        _LOGGER.error("Failed to extract CSRF token from login page")
-                        raise ConfigEntryAuthFailed("Failed to obtain CSRF token")
-                    
-                    _LOGGER.debug("Extracted CSRF token")
-                    
-                    # Store cookies from GET request
-                    initial_cookies = get_resp.cookies
-                
-                # Step 2: POST login with CSRF token and credentials
-                await self.rate_limiter.acquire()
-                
-                payload = {
+            # Step 2: POST login credentials
+            _LOGGER.debug("Step 2: Posting login credentials")
+            
+            # Determine if this is an email or username login
+            is_email = "@" in self.username
+            
+            # Build login data based on login type
+            if is_email:
+                _LOGGER.debug("Detected email format - using Email field")
+                login_data = {
                     "Email": self.username,
                     "Password": self.password,
-                    "__RequestVerificationToken": csrf_token,
                 }
-                
-                async with self.session.post(
-                    self.LOGIN_URL,
-                    data=payload,
-<<<<<<< HEAD
-                    allow_redirects=True,
-=======
-                    cookies=initial_cookies,
-                    allow_redirects=False,  # Don't auto-follow redirects
->>>>>>> 988f4ceecb7c9c82c57bea4e5ecb778a388dc5aa
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Content-Type": "application/x-www-form-urlencoded",
-<<<<<<< HEAD
-                        "Origin": "https://trackmategps.com",
-                        "Referer": self.LOGIN_URL,
-                    }
-                ) as resp:
-                    _LOGGER.debug("Login response: status=%d, url=%s", resp.status, resp.url)
-                    
-                    final_url = str(resp.url)
-                    
-                    # Check if still on login page (failed)
-                    if "Login" in final_url or "login" in final_url:
-                        _LOGGER.error("Login failed - still on login page")
-                        raise ConfigEntryAuthFailed("Invalid username or password")
-                    
-                    # Success - save cookies
-                    self.cookies = resp.cookies
-                    self.cookie_expiry = datetime.now() + timedelta(hours=COOKIE_EXPIRY_HOURS)
-                    
-                    _LOGGER.info("Login successful, redirected to: %s", final_url)
-                    await self._save_cookies()
-=======
-                        "Referer": self.LOGIN_URL,
-                    }
-                ) as post_resp:
-                    # Check for successful login
-                    # Trackmate redirects on success (302), stays on login page on failure
-                    if post_resp.status == 302 or post_resp.status == 200:
-                        # Check redirect location or response
-                        location = post_resp.headers.get("Location", "")
-                        
-                        # If redirected back to login, auth failed
-                        if "/Login" in location or post_resp.status == 200:
-                            resp_text = await post_resp.text()
-                            if "invalid" in resp_text.lower() or "incorrect" in resp_text.lower():
-                                _LOGGER.error("Login failed - invalid credentials")
-                                raise ConfigEntryAuthFailed("Invalid username or password")
-                        
-                        # Success - merge cookies
-                        self.cookies = {**initial_cookies, **post_resp.cookies}
-                        self.cookie_expiry = datetime.now() + timedelta(hours=COOKIE_EXPIRY_HOURS)
-                        
-                        _LOGGER.info("Login successful, cookies valid until %s", self.cookie_expiry)
-                        await self._save_cookies()
-                    else:
-                        _LOGGER.error("Unexpected response status: %d", post_resp.status)
-                        raise ConfigEntryAuthFailed(f"Login failed with status {post_resp.status}")
->>>>>>> 988f4ceecb7c9c82c57bea4e5ecb778a388dc5aa
-                    
-            except aiohttp.ClientError as err:
-                _LOGGER.error("Network error during login: %s", err)
-                raise ConfigEntryAuthFailed(f"Network error: {err}")
-            except asyncio.TimeoutError:
-                _LOGGER.error("Login request timed out")
-                raise ConfigEntryAuthFailed("Login request timed out")
-    
-    def _extract_csrf_token(self, html: str) -> Optional[str]:
-        """Extract CSRF token from login page HTML.
-        
-        Args:
-            html: HTML content of login page.
+            else:
+                _LOGGER.debug("Detected username format - using Username field")
+                login_data = {
+                    "Username": self.username,
+                    "Password": self.password,
+                }
             
-        Returns:
-            CSRF token string or None if not found.
-        """
-        import re
+            if csrf_token:
+                login_data["__RequestVerificationToken"] = csrf_token
+            
+            _LOGGER.debug("Login data prepared with fields: %s", list(login_data.keys()))
+            
+            async with self.session.post(
+                self.LOGIN_URL,
+                data=login_data,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://trackmategps.com",
+                    "Referer": self.LOGIN_URL,
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0",
+                }
+            ) as resp:
+                _LOGGER.debug("Login POST response status: %d", resp.status)
+                _LOGGER.debug("Final URL after redirects: %s", resp.url)
+                
+                # Read response HTML for debugging
+                response_html = await resp.text()
+                _LOGGER.debug("Response HTML length: %d", len(response_html))
+                
+                # If we hit an error page, log the content
+                if "Error" in str(resp.url) or "error" in str(resp.url).lower():
+                    _LOGGER.error("Error page HTML (first 1000 chars): %s", response_html[:1000])
+                
+                # Check if redirected to tracking page (success)
+                if "Tracking" in str(resp.url):
+                    _LOGGER.info("Login successful! Redirected to: %s", resp.url)
+                    
+                    # Extract cookies from session
+                    cookies = {}
+                    for cookie in self.session.cookie_jar:
+                        cookies[cookie.key] = cookie.value
+                    
+                    _LOGGER.info("Got %d cookies", len(cookies))
+                    
+                    if not cookies:
+                        _LOGGER.error("No cookies received after login!")
+                        raise ConfigEntryAuthFailed("Login succeeded but no cookies received")
+                    
+                    return cookies
+                    
+                elif "Error" in str(resp.url) or "Login" in str(resp.url):
+                    _LOGGER.error("Login failed - redirected to: %s", resp.url)
+                    raise ConfigEntryAuthFailed("Invalid credentials or login rejected")
+                else:
+                    _LOGGER.warning("Unexpected redirect: %s", resp.url)
+                    raise ConfigEntryAuthFailed("Unexpected login response")
+                    
+        except aiohttp.ClientError as err:
+            _LOGGER.error("HTTP error during login: %s (type: %s)", err, type(err).__name__)
+            _LOGGER.exception("Full traceback:")
+            raise ConfigEntryAuthFailed(f"Network error: {err}")
+        except asyncio.TimeoutError:
+            _LOGGER.error("Login timed out after 30 seconds")
+            _LOGGER.error("This usually means network connectivity issue or DNS problem")
+            raise ConfigEntryAuthFailed("Login timeout - check network connectivity")
+        except Exception as err:
+            _LOGGER.error("Unexpected error during login: %s (type: %s)", err, type(err).__name__)
+            _LOGGER.exception("Full traceback:")
+            raise ConfigEntryAuthFailed(f"Login failed: {err}")
+
+    async def _refresh_cookies(self):
+        """Refresh authentication cookies."""
+        _LOGGER.info("==> _refresh_cookies() START <==")
         
-        # Try multiple patterns as websites use different token names
-        patterns = [
-            r'<input[^>]*name=["\']__RequestVerificationToken["\'][^>]*value=["\']([^"\']+)["\']',
-            r'<input[^>]*value=["\']([^"\']+)["\'][^>]*name=["\']__RequestVerificationToken["\']',
-            r'name="__RequestVerificationToken"[^>]*value="([^"]+)"',
-            r'value="([^"]+)"[^>]*name="__RequestVerificationToken"',
-        ]
+        async with self._login_lock:
+            _LOGGER.info("==> Login lock acquired!")
+            _LOGGER.info("==> About to acquire rate limiter...")
+            
+            await self.rate_limiter.acquire()
+            
+            _LOGGER.info("==> Rate limiter acquired!")
+            
+            try:
+                _LOGGER.info("==> About to call _http_login()")
+                _LOGGER.info("==> Session object: %s", self.session)
+                _LOGGER.info("==> Session closed: %s", self.session.closed if self.session else "No session")
+                
+                self.cookies = await self._http_login()
+                
+                _LOGGER.info("==> _http_login() returned!")
+                _LOGGER.debug("_http_login() returned successfully")
+                self.cookie_expiry = datetime.now() + timedelta(hours=COOKIE_EXPIRY_HOURS)
+                await self._save_cookies()
+                _LOGGER.info("Cookies refreshed successfully, valid until %s", self.cookie_expiry)
+                
+                # Send notification to user (only for real entries, not validation)
+                if self.entry_id != "temp":
+                    await self.hass.services.async_call(
+                        "persistent_notification",
+                        "create",
+                        {
+                            "title": "Trackmate GPS",
+                            "message": f"Cookies refreshed successfully for {self.username}",
+                            "notification_id": f"trackmate_{self.entry_id}"
+                        }
+                    )
+                    
+            except Exception as err:
+                _LOGGER.error("Failed to refresh cookies: %s", err)
+                # Send error notification (only for real entries)
+                if self.entry_id != "temp":
+                    await self.hass.services.async_call(
+                        "persistent_notification",
+                        "create",
+                        {
+                            "title": "⚠️ Trackmate GPS Error",
+                            "message": f"Failed to refresh cookies for {self.username}: {err}",
+                            "notification_id": f"trackmate_error_{self.entry_id}"
+                        }
+                    )
+                raise
+
+    async def login(self):
+        """Ensure we have valid cookies."""
+        _LOGGER.debug("login() called")
         
-        for pattern in patterns:
-            match = re.search(pattern, html, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        
-        _LOGGER.warning("Could not find CSRF token in login page")
-        return None
+        # Check if we have valid cookies
+        if self.cookies and self.cookie_expiry:
+            time_until_expiry = (self.cookie_expiry - datetime.now()).total_seconds()
+            if time_until_expiry > COOKIE_REFRESH_BEFORE_EXPIRY:
+                _LOGGER.debug("Using cached cookies (valid for %.0f more seconds)", time_until_expiry)
+                return
+
+        # Need to refresh
+        _LOGGER.debug("Need to refresh cookies, calling _refresh_cookies()")
+        await self._refresh_cookies()
 
     async def get_positions(self) -> Dict[str, Any]:
         """Get latest vehicle positions."""
@@ -304,8 +415,8 @@ class TrackmateAPI:
                     "Referer": "https://trackmategps.com/en-US/Tracking",
                 }
             ) as resp:
-                # Check if we got redirected to login (session expired)
-                if resp.url.path.endswith("/Login") or "/Account/Login" in str(resp.url):
+                # Check if redirected to login (cookies expired)
+                if "/Login" in str(resp.url) or "/Account/Login" in str(resp.url):
                     _LOGGER.warning("Session expired, forcing re-authentication")
                     self.cookies = None
                     self.cookie_expiry = None
@@ -320,7 +431,7 @@ class TrackmateAPI:
                 return data
                 
         except aiohttp.ClientResponseError as err:
-            if err.status == 401 or err.status == 403:
+            if err.status in (401, 403):
                 _LOGGER.error("Authentication error (status %d), forcing re-auth", err.status)
                 self.cookies = None
                 self.cookie_expiry = None
@@ -336,15 +447,29 @@ class TrackmateAPI:
 
     async def test_connection(self) -> bool:
         """Test the API connection."""
+        _LOGGER.error("!!! TEST_CONNECTION CALLED !!!")
+        _LOGGER.info("Testing Trackmate API connection...")
+        
         try:
+            _LOGGER.error("!!! Step 1: Calling login() !!!")
             await self.login()
+            
+            _LOGGER.error("!!! Step 2: Login succeeded, calling get_positions() !!!")
             await self.get_positions()
+            
+            _LOGGER.error("!!! Step 3: Everything succeeded !!!")
+            _LOGGER.info("Connection test PASSED")
             return True
-        except ConfigEntryAuthFailed:
-            return False
+            
+        except ConfigEntryAuthFailed as err:
+            _LOGGER.error("!!! TEST FAILED: ConfigEntryAuthFailed: %s !!!", err)
+            _LOGGER.exception("Full traceback:")
+            raise  # Re-raise so config_flow sees it
+            
         except Exception as err:
-            _LOGGER.error("Connection test failed: %s", err)
-            return False
+            _LOGGER.error("!!! TEST FAILED: Unexpected error: %s (type: %s) !!!", err, type(err).__name__)
+            _LOGGER.exception("Full traceback:")
+            raise  # Re-raise so config_flow sees it
 
     async def get_diagnostics(self) -> Dict[str, Any]:
         """Get diagnostic information."""
@@ -354,4 +479,6 @@ class TrackmateAPI:
             "rate_limiter_requests": len(self.rate_limiter.requests),
             "rate_limiter_max": self.rate_limiter.max_requests,
             "rate_limiter_window": self.rate_limiter.window,
+            "username": self.username,
+            "auto_refresh_enabled": self._refresh_unsub is not None,
         }
