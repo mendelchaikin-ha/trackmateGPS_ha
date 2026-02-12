@@ -46,7 +46,13 @@ class TrackmateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed(str(e)) from e
 
         try:
+            t0 = time.monotonic()
             vehicles = await self.client.get_vehicles()
+            elapsed_s = time.monotonic() - t0
+            _LOGGER.debug(
+                "Finished fetching trackmate data in "
+                "%.1f seconds (vehicles: %d)",
+                elapsed_s, len(vehicles))
         except TrackmateAuthError as e:
             raise ConfigEntryAuthFailed(str(e)) from e
         except TrackmateConnectionError as e:
