@@ -2,31 +2,17 @@
 
 DOMAIN = "trackmate"
 
-# Configuration
+CONF_FLARESOLVERR_URL = "flaresolverr_url"
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
-CONF_LABEL = "label"
-CONF_BUSES = "buses"
 CONF_SCAN_INTERVAL = "scan_interval"
+CONF_VEHICLE_IDS = "vehicle_ids"
+CONF_SESSION_REFRESH = "session_refresh_minutes"
 
-# Data storage keys
-DATA_COORDINATOR = "coordinator"
-DATA_API = "api"
-DATA_STORE = "store"
+DEFAULT_FS_URL = "http://localhost:8191/v1"
+DEFAULT_SCAN_INTERVAL = 60
+DEFAULT_SESSION_REFRESH = 30
 
-# Defaults
-DEFAULT_SCAN_INTERVAL = 30  # seconds
-MIN_SCAN_INTERVAL = 10  # seconds - rate limiting
-MAX_SCAN_INTERVAL = 300  # seconds
-
-# Storage
-STORAGE_VERSION = 1
-STORAGE_KEY = f"{DOMAIN}_cookies"
-
-# Rate limiting
-RATE_LIMIT_REQUESTS = 60  # max requests per hour
-RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
-
-# Cookie persistence
-COOKIE_EXPIRY_HOURS = 12
-COOKIE_REFRESH_BEFORE_EXPIRY = 300  # 5 minutes in seconds
+BASE_URL = "https://trackmategps.com"
+LOGIN_URL = f"{BASE_URL}/en/Account/Login"
+MAP_URL = f"{BASE_URL}/en/Map"
