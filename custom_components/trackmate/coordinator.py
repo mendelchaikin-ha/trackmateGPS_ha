@@ -27,6 +27,11 @@ class TrackmateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_login = time.monotonic()
         self._refresh_mins = entry.options.get(
             CONF_SESSION_REFRESH, DEFAULT_SESSION_REFRESH)
+        
+        # ADDED: Track consecutive failures to tolerate transient issues
+        self._consecutive_failures = 0
+        self._max_consecutive_failures = 3
+        
         super().__init__(
             hass, _LOGGER, name=DOMAIN,
             update_interval=timedelta(
@@ -43,6 +48,24 @@ class TrackmateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except TrackmateAuthError as e:
                 raise ConfigEntryAuthFailed(str(e)) from e
             except TrackmateConnectionError as e:
+                # CHANGED: Don't immediately fail on login connection error
+                self._consecutive_failures += 1
+                _LOGGER.warning(
+                    "Login connection error (attempt %d/%d): %s",
+                    self._consecutive_failures,
+                    self._max_consecutive_failures,
+                    e,
+                )
+                
+                # Only fail after multiple consecutive failures
+                if self._consecutive_failures >= self._max_consecutive_failures:
+                    raise UpdateFailed(f"Login failed after {self._consecutive_failures} attempts: {e}") from e
+                
+                # Return cached data if available
+                if self.data:
+                    _LOGGER.debug("Login failed, returning cached vehicle data")
+                    return self.data
+                
                 raise UpdateFailed(str(e)) from e
 
         try:
@@ -53,11 +76,51 @@ class TrackmateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Finished fetching trackmate data in "
                 "%.1f seconds (vehicles: %d)",
                 elapsed_s, len(vehicles))
+            
+            # ADDED: Reset failure counter on success
+            self._consecutive_failures = 0
+            
         except TrackmateAuthError as e:
             raise ConfigEntryAuthFailed(str(e)) from e
         except TrackmateConnectionError as e:
+            # CHANGED: Don't immediately fail on connection error
+            self._consecutive_failures += 1
+            _LOGGER.warning(
+                "Connection error fetching vehicles (attempt %d/%d): %s",
+                self._consecutive_failures,
+                self._max_consecutive_failures,
+                e,
+            )
+            
+            # Only fail after multiple consecutive failures
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                raise UpdateFailed(f"Failed to fetch vehicles after {self._consecutive_failures} attempts: {e}") from e
+            
+            # Return cached data if available
+            if self.data:
+                _LOGGER.debug("Fetch failed, returning cached vehicle data")
+                return self.data
+            
             raise UpdateFailed(str(e)) from e
         except TrackmateError as e:
+            # CHANGED: Don't immediately fail on other errors
+            self._consecutive_failures += 1
+            _LOGGER.warning(
+                "Error fetching vehicles (attempt %d/%d): %s",
+                self._consecutive_failures,
+                self._max_consecutive_failures,
+                e,
+            )
+            
+            # Only fail after multiple consecutive failures
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                raise UpdateFailed(f"Failed to fetch vehicles after {self._consecutive_failures} attempts: {e}") from e
+            
+            # Return cached data if available
+            if self.data:
+                _LOGGER.debug("Error occurred, returning cached vehicle data")
+                return self.data
+            
             raise UpdateFailed(str(e)) from e
 
         selected = self.entry.options.get(CONF_VEHICLE_IDS, [])
