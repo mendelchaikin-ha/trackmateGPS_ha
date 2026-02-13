@@ -61,6 +61,11 @@ class TrackmateTracker(CoordinatorEntity[TrackmateCoordinator], TrackerEntity):
             "model": "GPS Tracker",
             "via_device": (DOMAIN, f"account_{username}"),
         }
+        
+        # ADDED: Cache last known position and attributes
+        self._last_latitude: float | None = vdata.get("latitude")
+        self._last_longitude: float | None = vdata.get("longitude")
+        self._last_attributes: dict[str, Any] = {}
 
     @property
     def _vd(self) -> dict[str, Any] | None:
@@ -72,24 +77,63 @@ class TrackmateTracker(CoordinatorEntity[TrackmateCoordinator], TrackerEntity):
 
     @property
     def latitude(self) -> float | None:
-        return (d := self._vd) and d.get("latitude")
+        # CHANGED: Cache and return last known position
+        if d := self._vd:
+            if lat := d.get("latitude"):
+                self._last_latitude = lat
+                return lat
+        # Return cached position if current data unavailable
+        return self._last_latitude
 
     @property
     def longitude(self) -> float | None:
-        return (d := self._vd) and d.get("longitude")
+        # CHANGED: Cache and return last known position
+        if d := self._vd:
+            if lon := d.get("longitude"):
+                self._last_longitude = lon
+                return lon
+        # Return cached position if current data unavailable
+        return self._last_longitude
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         attrs: dict[str, Any] = {}
         if d := self._vd:
+            # Update cache with current data
             for k in ("speed", "heading"):
                 if d.get(k) is not None:
                     attrs[k] = d[k]
+                    self._last_attributes[k] = d[k]
             if d.get("last_update"):
                 attrs["trackmate_last_update"] = d["last_update"]
-            attrs["trackmate_source"] = d.get("source", "unknown")
+                self._last_attributes["trackmate_last_update"] = d["last_update"]
+            source = d.get("source", "unknown")
+            attrs["trackmate_source"] = source
+            self._last_attributes["trackmate_source"] = source
+        elif self._last_attributes:
+            # ADDED: Return cached attributes if current data unavailable
+            attrs = self._last_attributes.copy()
+        
         return attrs
 
     @property
     def available(self) -> bool:
-        return super().available and self._vid in (self.coordinator.data or {})
+        # CHANGED: Available if we have current data OR cached position
+        # This prevents going unavailable during transient failures
+        
+        # If we have current data for this vehicle, definitely available
+        if self._vid in (self.coordinator.data or {}):
+            return super().available
+        
+        # If coordinator is working (even if this vehicle not in current data),
+        # stay available if we have cached position
+        if super().available and self._last_latitude is not None and self._last_longitude is not None:
+            return True
+        
+        # If we have cached position, stay available even if coordinator failed
+        # (coordinator might be returning cached data that doesn't include this vehicle)
+        if self._last_latitude is not None and self._last_longitude is not None:
+            return True
+        
+        # No current data and no cached position - unavailable
+        return False
